@@ -4,6 +4,8 @@ A unified, single-file Python application implementing the classic **Ross-Macdon
 
 Featuring a cohesive, pure-white design where the **transmission dynamics graph** and the **full LaTeX mathematical derivation (with user inputs substituted)** are presented together on a single unified canvas.
 
+> 📖 **Full Technical & Mathematical Documentation:** See [`DOCUMENTATION.md`](file:///c:/Programming/malaria-model/DOCUMENTATION.md) for in-depth derivations, stability analysis, parameter references, and architecture details.
+
 ---
 
 ## How to Run
