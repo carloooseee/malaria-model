@@ -1,10 +1,19 @@
-"""Malaria Transmission Simulator (Ross-Macdonald Mathematical Model).
+"""Malaria Transmission Simulator — Gordon & Guilfoos Chapter 14 Model.
 
-A unified, self-contained single-file Python application implementing both the
-baseline Ross-Macdonald model (with extrinsic incubation period tau) and an
-extended climate-driven model using 4th-order Runge-Kutta (RK4) integration.
-Presents dynamic transmission plots alongside publication-ready LaTeX formulas,
-automated numerical verification checks, sensitivity analysis, and PNG/CSV exports.
+A self-contained single-file Python application implementing the exact 5-compartment
+Malaria Modeling Project (Chapter 14 of Gordon & Guilfoos):
+  - Humans: Healthy (H), Sick (S), Immune (I)
+  - Mosquitoes: Healthy (M_H), Infected (M_I)
+
+Includes 4th-order Runge-Kutta (RK4) integration (dt = 0.1 day, daily output),
+all three optional extensions from the project specification:
+  1. Relapse / Remission (17% relapse probability)
+  2. Seasonal Mosquito Birth & Death Rates (cosine forcing)
+  3. Ghana Insecticide-Treated Net (ITN) Policy & Cost-Benefit Analysis
+     (calibrated with Asante & Asenso-Okyere, 2003, WHO/AFRO Ghana Report)
+
+Also provides automated verification checks, immunity & bite-rate sensitivity
+analysis, vertical LaTeX equation rendering, and PNG/CSV exports.
 
 Requirements:
     pip install numpy matplotlib
@@ -14,6 +23,7 @@ Requirements:
 # IMPORTS
 # ==============================================================================
 import csv
+import math
 import os
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
@@ -31,9 +41,9 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 # ==============================================================================
 
 # Graphical User Interface (GUI) Settings (Pure white minimal theme)
-APP_TITLE = "Malaria Model: Ross-Macdonald Transmission Simulator"
-APP_SUBTITLE = "Baseline & Climate-Driven Host-Vector Models, RK4 Integration & Analytical Solution"
-WINDOW_SIZE = "980x1000"
+APP_TITLE = "Malaria Modeling Project — Chapter 14 Simulator"
+APP_SUBTITLE = "5-Compartment Villager & Mosquito Population Model (RK4) with Seasonal, Relapse & Ghana ITN Extensions"
+WINDOW_SIZE = "1020x980"
 BG_COLOR = "#FFFFFF"
 FG_COLOR = "#111827"
 MUTED_COLOR = "#4B5563"
@@ -41,33 +51,41 @@ BORDER_COLOR = "#E5E7EB"
 CARD_BG = "#FAFAFA"
 ACCENT_GREEN = "#15803D"
 ACCENT_RED = "#B91C1C"
+ACCENT_BLUE = "#1E3A8A"
 
-# Default Baseline Model Parameters (based on Gordon & Guilfoos Chapter 14)
+# Default Chapter 14 Baseline Parameters (exact values from MALARIA-MODELING-PROJECT.pdf)
 # Tuple format: (Label text, default value, parameter key)
-BASELINE_FIELDS = [
-    ("Human Pop. (N):", "1000", "N"),
-    ("Mosquito Pop. (M):", "5000", "M"),
-    ("Biting Rate (a):", "0.25", "a"),
-    ("Prob M->H (b):", "0.30", "b"),
-    ("Prob H->M (c):", "0.15", "c"),
-    ("Recovery Rate (r):", "0.01", "r"),
-    ("Mosq. Mortality (μ_m):", "0.10", "mu_m"),
-    ("EIP (τ, days):", "10", "tau"),
-    ("Duration (Days):", "365", "days"),
+POPULATION_FIELDS = [
+    ("Healthy Humans (H0):", "499", "H0"),
+    ("Sick Humans (S0):", "1", "S0"),
+    ("Immune Humans (I0):", "0", "I0"),
+    ("Healthy Mosq. (MH0):", "1000", "MH0"),
+    ("Infected Mosq. (MI0):", "0", "MI0"),
+    ("Duration (Days):", "200", "days"),
 ]
 
-# Default Extended (Climate-Driven) Model Parameters
-EXTENDED_FIELDS = [
-    ("Mean Temp (T_mean, °C):", "25", "T_mean"),
-    ("Temp Amp (A_T, °C):", "4", "A_T"),
-    ("Peak Day (t_p):", "150", "t_p"),
-    ("Seasonality (κ):", "0.5", "kappa"),
+RATE_FIELDS = [
+    ("Human Birth Rate:", "0.000092", "birth_rate"),
+    ("Human Death Rate:", "0.00001945", "death_rate"),
+    ("Malaria Death Rate:", "0.00016123", "malaria_death_rate"),
+    ("Human Immunity Rate:", "0.01", "immunity_rate"),
+    ("Mosq. Birth Rate:", "0.01", "mosq_birth_rate"),
+    ("Mosq. Death Rate:", "0.011", "mosq_death_rate"),
+    ("Mosq. Bite Rate:", "0.24", "bite_rate"),
+    ("Ghana COI ($/case):", "15.79", "ghana_coi"),
+    ("Ghana Family Size:", "5.14", "family_size"),
 ]
 
-# Simulation Constants
-INITIAL_INFECTED_HUMANS_RATIO = 0.01      # 1% of human population initially infected
-INITIAL_INFECTED_MOSQUITOES_RATIO = 0.00  # 0% of mosquito population initially infected
-TIME_STEP = 0.1                           # RK4 integration step size (0.1 day)
+# Simulation & Extension Constants (from MALARIA-MODELING-PROJECT.pdf)
+TIME_STEP = 0.1                      # RK4 integration step size (0.1 day)
+MAX_MOSQ_BIRTH_RATE = 0.02           # Optional Addition 2: seasonal peak mbr
+MAX_MOSQ_DEATH_RATE = 0.022          # Optional Addition 2: seasonal peak mdr
+RELAPSE_PROBABILITY = 0.17           # Optional Addition 1: 17% relapse probability
+ITN_REDUCTION = 0.50                 # Optional Addition 3: 50% incidence reduction vs no nets
+UNTREATED_REDUCTION = 0.1803         # Derived from 39% ITN reduction vs untreated: 1 - 0.50/(1-0.39)
+ITN_COST_USD = 3.50                  # Cost per treated net (covers 2 people)
+UNTREATED_NET_COST_USD = 2.50        # Cost per untreated net (covers 2 people)
+PEOPLE_PER_NET = 2.0                 # Coverage per net
 
 
 # ==============================================================================
@@ -76,53 +94,59 @@ TIME_STEP = 0.1                           # RK4 integration step size (0.1 day)
 
 @dataclass
 class SimulationParameters:
-    """Input parameters for baseline and climate-driven Ross-Macdonald models."""
-    N: float             # Total human population size
-    M: float             # Total mosquito population size
-    a: float             # Baseline biting rate (bites per mosquito per day)
-    b: float             # Transmission prob: infectious mosquito -> susceptible human
-    c: float             # Transmission prob: infectious human -> susceptible mosquito
-    r: float             # Human recovery rate (1/r = mean infectious duration in days)
-    mu_m: float          # Baseline mosquito mortality rate (day^-1)
-    tau: float           # Extrinsic incubation period (days)
-    days: int            # Total simulation duration in days
-    T_mean: float = 25.0 # Mean annual temperature (°C)
-    A_T: float = 4.0     # Seasonal temperature amplitude (°C)
-    t_p: float = 150.0   # Day of seasonal peak (days)
-    kappa: float = 0.5   # Seasonal mosquito density amplitude (0 <= kappa <= 1)
+    """Input parameters for the Chapter 14 Malaria Modeling Project."""
+    H0: float = 499.0                 # Starting healthy villagers
+    S0: float = 1.0                   # Starting sick villagers
+    I0: float = 0.0                   # Starting immune villagers
+    MH0: float = 1000.0               # Starting healthy mosquitoes
+    MI0: float = 0.0                  # Starting infected mosquitoes
+    days: int = 200                   # Simulation duration (200 or 2000 days)
+    birth_rate: float = 0.000092      # Human birth rate /day (0.03358/yr)
+    death_rate: float = 0.00001945    # Human natural death rate /day (0.0071/yr)
+    malaria_death_rate: float = 0.00016123  # Malaria-induced death rate /day (0.0588486/yr)
+    immunity_rate: float = 0.01       # Rate sick villagers gain immunity /day
+    mosq_birth_rate: float = 0.01     # Baseline mosquito birth rate /day
+    mosq_death_rate: float = 0.011    # Baseline mosquito death rate /day
+    bite_rate: float = 0.24           # Mosquito bite rate /day
+    ghana_coi: float = 15.79          # Avg household cost/episode in Ghana (US$, Asante & Asenso-Okyere 2003)
+    family_size: float = 5.14         # Avg Ghana household size ($13.51 / $2.63 from Ghana report)
+    use_seasonal: bool = False        # Optional Addition 2: seasonal cosine mbr/mdr
+    use_relapse: bool = False         # Optional Addition 1: 17% relapse probability
+    net_policy: str = "none"          # Optional Addition 3: "none", "untreated", or "itn"
+
+    @property
+    def recovery_rate(self) -> float:
+        """Human recovery rate = 1 - malaria_death_rate (exact Ch. 14 formula)."""
+        return 1.0 - self.malaria_death_rate
 
 
 @dataclass
 class SimulationResult:
-    """Baseline simulation output including daily trajectories, equilibria, and LaTeX."""
-    R0: float
-    m: float
+    """Daily population trajectories, cumulative burden, and LaTeX output."""
     t: np.ndarray
-    X: np.ndarray             # Daily infected human fraction
-    Y: np.ndarray             # Daily infected mosquito fraction
-    latex_code: str           # Ready-to-copy LaTeX code block
+    H: np.ndarray                     # Healthy villagers over time
+    S: np.ndarray                     # Sick villagers over time
+    I: np.ndarray                     # Immune villagers over time
+    MH: np.ndarray                    # Healthy mosquitoes over time
+    MI: np.ndarray                    # Infected mosquitoes over time
+    cum_infections: float             # Cumulative human malaria episodes
+    cum_malaria_deaths: float         # Cumulative malaria-induced deaths
+    peak_sick: float                  # Maximum simultaneous sick villagers
+    peak_sick_day: int                # Day of peak sick villagers
     days: int
-    numerator: float          # m * a^2 * b * c * exp(-mu_m * tau)
-    denominator: float        # r * mu_m
-    c_eff: float              # Effective human->mosquito transmission c * exp(-mu_m * tau)
-    x_star: Optional[float]   # Analytic human endemic equilibrium
-    y_star: Optional[float]   # Analytic mosquito endemic equilibrium
-
-
-@dataclass
-class ExtendedSimulationResult:
-    """Extended climate-driven simulation output (daily trajectories)."""
-    t: np.ndarray
-    x: np.ndarray             # Daily infected human fraction
-    z: np.ndarray             # Daily latent (exposed) mosquito fraction
-    v: np.ndarray             # Daily infectious mosquito fraction
-    T: np.ndarray             # Daily temperature (°C)
-    m: np.ndarray             # Daily mosquito-to-human ratio m(t)
-    days: int
+    latex_code: str
+    # Economic / ITN Policy metrics (populated when comparing against no-net baseline)
+    nets_needed: int = 0
+    households: float = 0.0
+    net_program_cost: float = 0.0
+    cases_averted: float = 0.0
+    economic_savings: float = 0.0
+    net_benefit: float = 0.0
+    bcr: float = 0.0
 
 
 def _rk4_step(rhs: Callable[[float, np.ndarray], np.ndarray], t: float, y: np.ndarray, dt: float) -> np.ndarray:
-    """Advance a state vector y by one step dt using 4th-order Runge-Kutta (RK4)."""
+    """Advance state vector y by one step dt using 4th-order Runge-Kutta (RK4)."""
     k1 = rhs(t, y)
     k2 = rhs(t + 0.5 * dt, y + 0.5 * dt * k1)
     k3 = rhs(t + 0.5 * dt, y + 0.5 * dt * k2)
@@ -130,242 +154,195 @@ def _rk4_step(rhs: Callable[[float, np.ndarray], np.ndarray], t: float, y: np.nd
     return y + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
 
 
-def calculate_r0(m: float, a: float, b: float, c: float, r: float, mu_m: float, tau: float) -> float:
-    r"""Calculate the Basic Reproduction Number (R0) with extrinsic incubation period tau.
+def _seasonal_mosquito_rates(t: float, params: SimulationParameters) -> Tuple[float, float]:
+    """Compute mosquito birth rate (mbr) and death rate (mdr) at time t (days)."""
+    if not params.use_seasonal:
+        return params.mosq_birth_rate, params.mosq_death_rate
+    # Exact Optional Addition 2 formulas from MALARIA-MODELING-PROJECT.pdf:
+    # mbr = (cos(t * 2*pi / 365) + 1) * max_mosquito_birth_rate / 2
+    # mdr = (cos(t * 2*pi / 365) + 1) * max_mosquito_death_rate / 2
+    factor = (float(np.cos((t * 2.0 * np.pi) / 365.0)) + 1.0) / 2.0
+    return factor * MAX_MOSQ_BIRTH_RATE, factor * MAX_MOSQ_DEATH_RATE
 
-    Mathematical Formulation:
-        R_0 = \frac{m \cdot a^2 \cdot b \cdot c \cdot e^{-\mu_m \tau}}{r \cdot \mu_m}
+
+def _effective_bite_rate(params: SimulationParameters) -> float:
+    """Adjust effective human infection bite rate based on mosquito net policy (Option 3)."""
+    if params.net_policy == "itn":
+        return params.bite_rate * (1.0 - ITN_REDUCTION)
+    if params.net_policy == "untreated":
+        return params.bite_rate * (1.0 - UNTREATED_REDUCTION)
+    return params.bite_rate
+
+
+def simulate_malaria(params: SimulationParameters, dt: float = TIME_STEP) -> SimulationResult:
+    """Simulate the 5-compartment Chapter 14 malaria model using RK4 (daily output).
+
+    State vector: [H, S, I, MH, MI, cum_inf, cum_m_deaths]
     """
-    numerator = m * (a ** 2) * b * c * float(np.exp(-mu_m * tau))
-    denominator = r * mu_m
-    return numerator / denominator
-
-
-def simulate_transmission(
-    params: SimulationParameters,
-    dt: float = TIME_STEP,
-    x0: float = INITIAL_INFECTED_HUMANS_RATIO,
-    y0: float = INITIAL_INFECTED_MOSQUITOES_RATIO,
-) -> SimulationResult:
-    r"""Simulate the baseline Ross-Macdonald ODEs with EIP tau using RK4 (daily output).
-
-    Governing Differential System:
-        dX/dt = m * a * b * Y * (1 - X) - r * X
-        dY/dt = a * c * exp(-mu_m * tau) * X * (1 - Y) - mu_m * Y
-    """
-    m = params.M / params.N
-    survival = float(np.exp(-params.mu_m * params.tau))
-    c_eff = params.c * survival
-    numerator = m * (params.a ** 2) * params.b * c_eff
-    denominator = params.r * params.mu_m
-    R0 = numerator / denominator
-
-    # Analytic endemic equilibrium (correct formula: R0 - 1 over R0 + a*c_eff/mu_m)
-    if R0 > 1.0:
-        ac_over_mu = (params.a * c_eff) / params.mu_m
-        x_star = (R0 - 1.0) / (R0 + ac_over_mu)
-        y_star = (params.a * c_eff * x_star) / (params.a * c_eff * x_star + params.mu_m)
-    else:
-        x_star = 0.0
-        y_star = 0.0
-
-    # RK4 integration with step dt, recording daily values
     substeps = max(1, int(round(1.0 / dt)))
     step_dt = 1.0 / substeps
+    rec_rate = params.recovery_rate
+    eff_bite = _effective_bite_rate(params)
+    # Option 1 (17% relapse): 17% of recovering villagers relapse back into Sick,
+    # leaving 83% net recovery back to Healthy.
+    net_rec_rate = rec_rate * (1.0 - RELAPSE_PROBABILITY) if params.use_relapse else rec_rate
 
     t_daily = np.arange(0, params.days + 1, dtype=float)
-    X_daily = np.zeros(params.days + 1, dtype=float)
-    Y_daily = np.zeros(params.days + 1, dtype=float)
-    state = np.array([x0, y0], dtype=float)
-    X_daily[0], Y_daily[0] = state[0], state[1]
+    H_d = np.zeros(params.days + 1, dtype=float)
+    S_d = np.zeros(params.days + 1, dtype=float)
+    I_d = np.zeros(params.days + 1, dtype=float)
+    MH_d = np.zeros(params.days + 1, dtype=float)
+    MI_d = np.zeros(params.days + 1, dtype=float)
 
-    def rhs(_t: float, y: np.ndarray) -> np.ndarray:
-        x_val, y_val = y[0], y[1]
-        dx = m * params.a * params.b * y_val * (1.0 - x_val) - params.r * x_val
-        dy = params.a * c_eff * x_val * (1.0 - y_val) - params.mu_m * y_val
-        return np.array([dx, dy], dtype=float)
+    state = np.array([params.H0, params.S0, params.I0, params.MH0, params.MI0, 0.0, 0.0], dtype=float)
+    H_d[0], S_d[0], I_d[0], MH_d[0], MI_d[0] = state[:5]
+
+    def rhs(t_val: float, y: np.ndarray) -> np.ndarray:
+        H, S, I, MH, MI = max(y[0], 0.0), max(y[1], 0.0), max(y[2], 0.0), max(y[3], 0.0), max(y[4], 0.0)
+        humans = H + S + I
+        mosq = MH + MI
+
+        mbr, mdr = _seasonal_mosquito_rates(t_val, params)
+
+        births = params.birth_rate * humans
+        healthy_dies = H * params.death_rate
+        infected = (eff_bite * H * (MI / mosq)) if mosq > 1e-12 else 0.0
+        sick_dies = (params.malaria_death_rate + params.death_rate) * S
+        malaria_deaths = params.malaria_death_rate * S
+        immune_dies = params.death_rate * I
+        recover = S * net_rec_rate
+        immune = S * params.immunity_rate
+
+        mosq_births = mosq * mbr
+        mosq_dies = MH * mdr
+        mosq_infection = (S / (humans + 1.0)) * MH * params.bite_rate
+        inf_mosq_dies = MI * mdr
+
+        dH = births + recover - healthy_dies - infected
+        dS = infected - recover - immune - sick_dies
+        dI = immune - immune_dies
+        dMH = mosq_births - mosq_dies - mosq_infection
+        dMI = mosq_infection - inf_mosq_dies
+
+        return np.array([dH, dS, dI, dMH, dMI, infected, malaria_deaths], dtype=float)
 
     t_curr = 0.0
     for day in range(params.days):
         for _ in range(substeps):
             state = _rk4_step(rhs, t_curr, state, step_dt)
+            state[:5] = np.maximum(state[:5], 0.0)
             t_curr += step_dt
-        X_daily[day + 1] = state[0]
-        Y_daily[day + 1] = state[1]
+        H_d[day + 1], S_d[day + 1], I_d[day + 1], MH_d[day + 1], MI_d[day + 1] = state[:5]
 
-    # Publication-ready LaTeX source code block
+    peak_sick = float(np.max(S_d))
+    peak_sick_day = int(np.argmax(S_d))
+    cum_inf = float(state[5])
+    cum_deaths = float(state[6])
+
+    # Option 3: Ghana ITN / Untreated Net Cost-Benefit Evaluation
+    init_pop = params.H0 + params.S0 + params.I0
+    nets_needed = int(math.ceil(init_pop / PEOPLE_PER_NET))
+    households = init_pop / max(params.family_size, 1.0)
+    net_cost = 0.0
+    cases_averted = 0.0
+    econ_savings = 0.0
+    net_benefit = 0.0
+    bcr = 0.0
+
+    if params.net_policy in ("itn", "untreated"):
+        unit_cost = ITN_COST_USD if params.net_policy == "itn" else UNTREATED_NET_COST_USD
+        net_cost = nets_needed * unit_cost
+        base_p = SimulationParameters(**{**params.__dict__, "net_policy": "none"})
+        base_res = simulate_malaria(base_p, dt=dt)
+        cases_averted = max(0.0, base_res.cum_infections - cum_inf)
+        econ_savings = cases_averted * params.ghana_coi
+        net_benefit = econ_savings - net_cost
+        bcr = econ_savings / net_cost if net_cost > 0 else 0.0
+
+    # LaTeX Export Block
     latex_code = (
         "% ==========================================================\n"
-        "% Ross-Macdonald Malaria Model: Formulas & Substituted Solution\n"
+        "% Chapter 14 Malaria Modeling Project — Equations & Summary\n"
         "% ==========================================================\n\n"
-        "% 1. Model Inputs Provided:\n"
-        f"% N = {params.N:.0f}, M = {params.M:.0f}, a = {params.a}, b = {params.b}, "
-        f"c = {params.c}, r = {params.r}, mu_m = {params.mu_m}, tau = {params.tau}, Days = {params.days}\n\n"
-        "% 2. Governing Differential Equations (with EIP tau):\n"
+        "% 1. Human & Mosquito Compartmental Equations:\n"
         "\\begin{aligned}\n"
-        "\\frac{dX}{dt} &= m \\cdot a \\cdot b \\cdot Y(t)\\,(1 - X(t)) - r \\cdot X(t) \\\\[6pt]\n"
-        "\\frac{dY}{dt} &= a \\cdot c \\cdot e^{-\\mu_m \\tau} \\cdot X(t)\\,(1 - Y(t)) - \\mu_m \\cdot Y(t)\n"
+        "\\frac{dH}{dt} &= b_h N + r_{\\text{eff}} S - d_h H - \\beta_{\\text{eff}} H \\frac{M_I}{M_H + M_I} \\\\[4pt]\n"
+        "\\frac{dS}{dt} &= \\beta_{\\text{eff}} H \\frac{M_I}{M_H + M_I} - (r_{\\text{eff}} + i_h + d_m + d_h) S \\\\[4pt]\n"
+        "\\frac{dI}{dt} &= i_h S - d_h I \\\\[4pt]\n"
+        "\\frac{dM_H}{dt} &= b_m(t)(M_H + M_I) - d_{\\text{mos}}(t) M_H - \\beta \\frac{S}{N + 1} M_H \\\\[4pt]\n"
+        "\\frac{dM_I}{dt} &= \\beta \\frac{S}{N + 1} M_H - d_{\\text{mos}}(t) M_I\n"
         "\\end{aligned}\n\n"
-        "% 3. Mosquito-to-Human Population Ratio:\n"
-        f"m = \\frac{{M}}{{N}} = \\frac{{{params.M:.0f}}}{{{params.N:.0f}}} = {m:.4f}\n\n"
-        "% 4. Basic Reproduction Number (R_0) & Analytical Evaluation:\n"
-        "\\begin{aligned}\n"
-        f"R_0 &= \\frac{{m \\cdot a^2 \\cdot b \\cdot c \\cdot e^{{-\\mu_m \\tau}}}}{{r \\cdot \\mu_m}} \\\\[6pt]\n"
-        f"    &= \\frac{{{m:.4f} \\times ({params.a})^2 \\times {params.b} \\times {params.c} \\times e^{{-{params.mu_m} \\cdot {params.tau}}}}}{{{params.r} \\times {params.mu_m}}} \\\\[6pt]\n"
-        f"    &= \\frac{{{numerator:.7f}}}{{{denominator:.7f}}} \\\\[6pt]\n"
-        f"    &= {R0:.4f} \\quad \\left(R_0 {' > 1 \\implies \\text{Endemic Persistence}' if R0 > 1 else ' \\leq 1 \\implies \\text{Disease Dies Out}'}\\right)\n"
-        "\\end{aligned}\n\n"
-        "% 5. Analytic Steady-State Equilibrium:\n"
-        "\\begin{aligned}\n"
-        f"X^* &= \\frac{{R_0 - 1}}{{R_0 + \\frac{{a \\cdot c \\cdot e^{{-\\mu_m \\tau}}}}{{\\mu_m}}}} = {x_star:.4f} \\quad ({x_star*100:.2f}\\%)\\\\[6pt]\n"
-        f"Y^* &= \\frac{{a \\cdot c \\cdot e^{{-\\mu_m \\tau}} \\cdot X^*}}{{a \\cdot c \\cdot e^{{-\\mu_m \\tau}} \\cdot X^* + \\mu_m}} = {y_star:.4f} \\quad ({y_star*100:.2f}\\%)\n"
-        "\\end{aligned}\n"
+        f"% 2. Simulation Output (Day {params.days}):\n"
+        f"% H = {H_d[-1]:.2f}, S = {S_d[-1]:.2f}, I = {I_d[-1]:.2f}, "
+        f"M_H = {MH_d[-1]:.2f}, M_I = {MI_d[-1]:.2f}\n"
+        f"% Peak Sick = {peak_sick:.2f} (Day {peak_sick_day}), Cumulative Episodes = {cum_inf:.1f}\n"
     )
 
     return SimulationResult(
-        R0=R0,
-        m=m,
-        t=t_daily,
-        X=X_daily,
-        Y=Y_daily,
-        latex_code=latex_code,
-        days=params.days,
-        numerator=numerator,
-        denominator=denominator,
-        c_eff=c_eff,
-        x_star=x_star,
-        y_star=y_star,
-    )
-
-
-def _climate_forcing(t: float, params: SimulationParameters) -> Tuple[float, float, float, float, float]:
-    """Compute temperature T(t) and climate-driven rates a(T), mu(T), tau(T), m(t)."""
-    phase = 2.0 * np.pi * (t - params.t_p) / 365.0
-    sin_val = float(np.sin(phase))
-    T = params.T_mean + params.A_T * sin_val
-    a_T = 2.03e-4 * T * max(T - 11.7, 0.0) * float(np.sqrt(max(42.3 - T, 0.0)))
-    mu_T = 0.08 + 0.002 * ((T - 25.0) ** 2)
-    tau_T = 111.0 / max(T - 16.0, 1.0)
-    m0 = params.M / params.N
-    m_t = m0 * (1.0 + params.kappa * sin_val)
-    return T, a_T, mu_T, tau_T, m_t
-
-
-def simulate_extended(
-    params: SimulationParameters,
-    dt: float = TIME_STEP,
-    x0: float = INITIAL_INFECTED_HUMANS_RATIO,
-    z0: float = 0.0,
-    v0: float = 0.0,
-) -> ExtendedSimulationResult:
-    """Simulate the climate-driven extended Ross-Macdonald model using RK4 (daily output).
-
-    State vector: [x (infected humans), z (latent mosquitoes), v (infectious mosquitoes)].
-    """
-    substeps = max(1, int(round(1.0 / dt)))
-    step_dt = 1.0 / substeps
-
-    t_daily = np.arange(0, params.days + 1, dtype=float)
-    x_daily = np.zeros(params.days + 1, dtype=float)
-    z_daily = np.zeros(params.days + 1, dtype=float)
-    v_daily = np.zeros(params.days + 1, dtype=float)
-    T_daily = np.zeros(params.days + 1, dtype=float)
-    m_daily = np.zeros(params.days + 1, dtype=float)
-
-    state = np.array([x0, z0, v0], dtype=float)
-    T0, _, _, _, m0_t = _climate_forcing(0.0, params)
-    x_daily[0], z_daily[0], v_daily[0] = state[0], state[1], state[2]
-    T_daily[0], m_daily[0] = T0, m0_t
-
-    def rhs(t_val: float, y: np.ndarray) -> np.ndarray:
-        x_val, z_val, v_val = y[0], y[1], y[2]
-        _, a_T, mu_T, tau_T, m_t = _climate_forcing(t_val, params)
-        dx = m_t * a_T * params.b * v_val * (1.0 - x_val) - params.r * x_val
-        dz = a_T * params.c * x_val * (1.0 - z_val - v_val) - (1.0 / tau_T + mu_T) * z_val
-        dv = z_val / tau_T - mu_T * v_val
-        return np.array([dx, dz, dv], dtype=float)
-
-    t_curr = 0.0
-    for day in range(params.days):
-        for _ in range(substeps):
-            state = _rk4_step(rhs, t_curr, state, step_dt)
-            t_curr += step_dt
-        x_daily[day + 1], z_daily[day + 1], v_daily[day + 1] = state[0], state[1], state[2]
-        T_d, _, _, _, m_d = _climate_forcing(float(day + 1), params)
-        T_daily[day + 1] = T_d
-        m_daily[day + 1] = m_d
-
-    return ExtendedSimulationResult(
-        t=t_daily,
-        x=x_daily,
-        z=z_daily,
-        v=v_daily,
-        T=T_daily,
-        m=m_daily,
-        days=params.days,
+        t=t_daily, H=H_d, S=S_d, I=I_d, MH=MH_d, MI=MI_d,
+        cum_infections=cum_inf, cum_malaria_deaths=cum_deaths,
+        peak_sick=peak_sick, peak_sick_day=peak_sick_day,
+        days=params.days, latex_code=latex_code,
+        nets_needed=nets_needed, households=households,
+        net_program_cost=net_cost, cases_averted=cases_averted,
+        economic_savings=econ_savings, net_benefit=net_benefit, bcr=bcr,
     )
 
 
 def verify(params: Optional[SimulationParameters] = None) -> Tuple[bool, str]:
-    """Run automated verification assertions on both baseline and extended RK4 solvers.
+    """Run automated verification checks on the Chapter 14 RK4 simulator.
 
     Checks:
-      1. Bounds: 0 <= X, Y <= 1 and 0 <= x, z, v <= 1 and z + v <= 1 for all t; no NaNs.
-      2. Zero-infection invariance: x(0) = 0 (with zero infected vectors) remains 0.
-      3. Analytic convergence: baseline converges to x_star when R0 > 1 and decays to 0 when R0 < 1.
-      4. Temporal convergence: halving dt (0.1 -> 0.05) changes trajectories by < 1e-4.
+      1. Non-negativity & No NaN across all 5 compartments (baseline & all extensions).
+      2. Zero-infection invariance: S0=0, MI0=0 stays at S(t)=0, MI(t)=0 for all t.
+      3. Step-size convergence: halving dt (0.1 -> 0.05) changes trajectories by < 1e-4.
+      4. Policy monotonicity: ITN policy (50% reduction) reduces cumulative cases vs. no nets.
     """
     if params is None:
-        params = SimulationParameters(N=1000, M=5000, a=0.25, b=0.30, c=0.15, r=0.01, mu_m=0.10, tau=10, days=180)
+        params = SimulationParameters(days=200)
 
     report = []
     try:
-        # 1. Bounds & NaN check on both models
-        res_base = simulate_transmission(params, dt=0.1)
-        res_ext = simulate_extended(params, dt=0.1)
+        # 1. Non-negativity & NaN check (baseline + seasonal + relapse + ITN)
+        res = simulate_malaria(params, dt=0.1)
+        for name, arr in [("H", res.H), ("S", res.S), ("I", res.I), ("MH", res.MH), ("MI", res.MI)]:
+            assert not np.isnan(arr).any(), f"NaN found in {name}"
+            assert np.all(arr >= 0.0), f"Negative population found in {name}"
+        p_all = SimulationParameters(**{**params.__dict__, "use_seasonal": True, "use_relapse": True, "net_policy": "itn"})
+        res_all = simulate_malaria(p_all, dt=0.1)
+        for name, arr in [("H", res_all.H), ("S", res_all.S), ("I", res_all.I), ("MH", res_all.MH), ("MI", res_all.MI)]:
+            assert not np.isnan(arr).any() and np.all(arr >= 0.0), f"Invalid values in extended {name}"
+        report.append("PASS: Non-negativity (H, S, I, MH, MI >= 0) & No NaN")
 
-        assert not np.isnan(res_base.X).any() and not np.isnan(res_base.Y).any(), "NaN in baseline output"
-        assert np.all((res_base.X >= 0.0) & (res_base.X <= 1.0)), "Baseline X out of [0, 1]"
-        assert np.all((res_base.Y >= 0.0) & (res_base.Y <= 1.0)), "Baseline Y out of [0, 1]"
+        # 2. Zero-infection invariance
+        p_zero = SimulationParameters(**{**params.__dict__, "S0": 0.0, "MI0": 0.0})
+        res_zero = simulate_malaria(p_zero, dt=0.1)
+        assert np.allclose(res_zero.S, 0.0, atol=1e-12), "S did not stay 0 when S0=MI0=0"
+        assert np.allclose(res_zero.MI, 0.0, atol=1e-12), "MI did not stay 0 when S0=MI0=0"
+        report.append("PASS: Disease-free invariance (S0=0, MI0=0 stays 0)")
 
-        assert not (np.isnan(res_ext.x).any() or np.isnan(res_ext.z).any() or np.isnan(res_ext.v).any()), "NaN in extended output"
-        assert np.all((res_ext.x >= 0.0) & (res_ext.x <= 1.0)), "Extended x out of [0, 1]"
-        assert np.all((res_ext.z >= 0.0) & (res_ext.z <= 1.0)), "Extended z out of [0, 1]"
-        assert np.all((res_ext.v >= 0.0) & (res_ext.v <= 1.0)), "Extended v out of [0, 1]"
-        assert np.all(res_ext.z + res_ext.v <= 1.0 + 1e-12), "Extended z + v > 1"
-        report.append("PASS: Bounds (0<=x,z,v<=1, z+v<=1) & No NaN")
+        # 3. Step-size halving convergence (< 1e-4)
+        res_half = simulate_malaria(params, dt=0.05)
+        max_diff = max(
+            float(np.max(np.abs(res.H - res_half.H))),
+            float(np.max(np.abs(res.S - res_half.S))),
+            float(np.max(np.abs(res.I - res_half.I))),
+            float(np.max(np.abs(res.MH - res_half.MH))),
+            float(np.max(np.abs(res.MI - res_half.MI))),
+        )
+        assert max_diff < 1e-4, f"dt halving max diff {max_diff:.2e} >= 1e-4"
+        report.append(f"PASS: RK4 step-size convergence (dt 0.1->0.05 max diff = {max_diff:.2e} < 1e-4)")
 
-        # 2. Zero initial infection invariance: x(0)=0 stays 0
-        z_base = simulate_transmission(params, dt=0.1, x0=0.0, y0=0.0)
-        z_ext = simulate_extended(params, dt=0.1, x0=0.0, z0=0.0, v0=0.0)
-        assert np.allclose(z_base.X, 0.0, atol=1e-12), "Baseline x(0)=0 did not stay 0"
-        assert np.allclose(z_ext.x, 0.0, atol=1e-12), "Extended x(0)=0 did not stay 0"
-        report.append("PASS: x(0)=0 invariance")
-
-        # 3. Analytic convergence (R0 > 1 -> x_star; R0 < 1 -> 0)
-        p_endemic = SimulationParameters(N=1000, M=5000, a=0.25, b=0.30, c=0.15, r=0.01, mu_m=0.10, tau=10, days=2000)
-        r_endemic = simulate_transmission(p_endemic, dt=0.1)
-        assert r_endemic.R0 > 1.0
-        err_eq = abs(r_endemic.X[-1] - r_endemic.x_star)
-        assert err_eq < 1e-4, f"Did not converge to x_star: diff={err_eq}"
-
-        p_die = SimulationParameters(N=1000, M=100, a=0.10, b=0.30, c=0.15, r=0.05, mu_m=0.10, tau=10, days=1000)
-        r_die = simulate_transmission(p_die, dt=0.1)
-        assert r_die.R0 < 1.0
-        assert r_die.X[-1] < 1e-4, f"Did not decay to 0: X[-1]={r_die.X[-1]}"
-        report.append(f"PASS: Analytic convergence (err={err_eq:.2e} for R0>1, X_end={r_die.X[-1]:.2e} for R0<1)")
-
-        # 4. dt halving convergence (< 1e-4)
-        base_half = simulate_transmission(params, dt=0.05)
-        ext_half = simulate_extended(params, dt=0.05)
-        diff_base = float(np.max(np.abs(res_base.X - base_half.X)))
-        diff_ext = float(np.max(np.abs(res_ext.x - ext_half.x)))
-        assert diff_base < 1e-4, f"Baseline dt halving diff {diff_base} >= 1e-4"
-        assert diff_ext < 1e-4, f"Extended dt halving diff {diff_ext} >= 1e-4"
-        report.append(f"PASS: dt halving (base={diff_base:.2e}, ext={diff_ext:.2e} < 1e-4)")
+        # 4. ITN effectiveness check
+        p_base = SimulationParameters(**{**params.__dict__, "net_policy": "none"})
+        p_itn = SimulationParameters(**{**params.__dict__, "net_policy": "itn"})
+        r_base = simulate_malaria(p_base, dt=0.1)
+        r_itn = simulate_malaria(p_itn, dt=0.1)
+        assert r_itn.cum_infections < r_base.cum_infections, "ITN did not reduce cumulative infections"
+        pct_drop = (1.0 - r_itn.cum_infections / r_base.cum_infections) * 100.0
+        report.append(f"PASS: ITN policy reduces cumulative infections by {pct_drop:.1f}% ({r_base.cum_infections:.1f} -> {r_itn.cum_infections:.1f})")
 
         return True, "\n".join(report)
-
     except AssertionError as err:
         report.append(f"FAIL: {err}")
         return False, "\n".join(report)
@@ -375,193 +352,174 @@ def verify(params: Optional[SimulationParameters] = None) -> Tuple[bool, str]:
 # SECTION 3: VISUALIZATION & LATEX RENDERING (UNIFIED FIGURE)
 # ==============================================================================
 
-def create_unified_figure(
-    params: SimulationParameters,
-    result: SimulationResult,
-    ext_result: Optional[ExtendedSimulationResult] = None,
-) -> Figure:
-    """Generate a single unified figure: transmission plot on top, large vertical LaTeX solution below."""
-    fig_height = 10.2 if ext_result is not None else 9.2
-    fig = plt.figure(figsize=(9.2, fig_height), dpi=100, facecolor=BG_COLOR)
+def create_unified_figure(params: SimulationParameters, result: SimulationResult) -> Figure:
+    """Generate unified figure: Human & Mosquito population plots on top, vertical LaTeX card below."""
+    fig = plt.figure(figsize=(9.6, 10.6), dpi=100, facecolor=BG_COLOR)
 
     # --------------------------------------------------------------------------
-    # TOP SUBPLOT: Dynamic Transmission Curves (+ Temperature if Extended)
+    # TOP-LEFT SUBPLOT: Human Population Sectors (Healthy, Sick, Immune)
     # --------------------------------------------------------------------------
-    plot_width = 0.80 if ext_result is not None else 0.87
-    ax_plot = fig.add_axes([0.08, 0.65, plot_width, 0.30])
-    ax_plot.set_facecolor(BG_COLOR)
-
-    if ext_result is None:
-        ax_plot.plot(result.t, result.X * 100, label="Infected Humans (%)", color="#D9381E", linewidth=2.2)
-        ax_plot.plot(result.t, result.Y * 100, label="Infected Mosquitoes (%)", color="#1F77B4", linestyle="--", linewidth=2.2)
-        if result.R0 > 1.0 and result.x_star is not None:
-            ax_plot.axhline(result.x_star * 100, color="#D9381E", linestyle=":", linewidth=1.3, alpha=0.8, label=f"Equilibrium x* ({result.x_star * 100:.1f}%)")
-        ax_plot.set_title(
-            f"Baseline Malaria Transmission Dynamics over {result.days} Days (RK4)",
-            fontsize=11.5, fontweight="bold", color=FG_COLOR, pad=8
-        )
-        ax_plot.legend(frameon=True, facecolor=BG_COLOR, edgecolor=BORDER_COLOR, fontsize=8.5, loc="center right")
-    else:
-        l1, = ax_plot.plot(result.t, result.X * 100, label="Baseline Humans (%)", color="#D9381E", linewidth=2.0)
-        l2, = ax_plot.plot(ext_result.t, ext_result.x * 100, label="Extended Humans (%)", color="#15803D", linewidth=2.2)
-        lines = [l1, l2]
-        if result.R0 > 1.0 and result.x_star is not None:
-            l_eq = ax_plot.axhline(result.x_star * 100, color="#D9381E", linestyle=":", linewidth=1.3, alpha=0.8, label=f"Baseline Eq. x* ({result.x_star * 100:.1f}%)")
-            lines.append(l_eq)
-
-        ax_temp = ax_plot.twinx()
-        l3, = ax_temp.plot(ext_result.t, ext_result.T, label="Temperature T(t) (°C)", color="#6B7280", linestyle="--", linewidth=1.5)
-        ax_temp.set_ylabel("Temperature (°C)", fontsize=9.5, color=MUTED_COLOR)
-        ax_temp.tick_params(axis="y", colors=MUTED_COLOR, labelsize=8.5)
-        lines.append(l3)
-
-        ax_plot.set_title(
-            f"Baseline vs. Extended (Climate-Driven) Dynamics over {result.days} Days (RK4)",
-            fontsize=11, fontweight="bold", color=FG_COLOR, pad=8
-        )
-        labels = [l.get_label() for l in lines]
-        ax_plot.legend(lines, labels, frameon=True, facecolor=BG_COLOR, edgecolor=BORDER_COLOR, fontsize=8.2, loc="upper left")
-
-    ax_plot.set_xlabel("Time (Days)", fontsize=9.5, color=MUTED_COLOR)
-    ax_plot.set_ylabel("Infected Proportion (%)", fontsize=9.5, color=MUTED_COLOR)
-    ax_plot.grid(True, linestyle=":", alpha=0.6, color="#D1D5DB")
-    ax_plot.tick_params(colors=MUTED_COLOR, labelsize=8.5)
+    ax_h = fig.add_axes([0.07, 0.67, 0.41, 0.27])
+    ax_h.set_facecolor(BG_COLOR)
+    ax_h.plot(result.t, result.H, label="Healthy (H)", color="#15803D", linewidth=2.1)
+    ax_h.plot(result.t, result.S, label="Sick (S)", color="#D9381E", linewidth=2.1)
+    ax_h.plot(result.t, result.I, label="Immune (I)", color="#1F77B4", linestyle="--", linewidth=2.1)
+    ax_h.set_title(f"Human Population Sectors ({result.days} Days)", fontsize=10.5, fontweight="bold", color=FG_COLOR, pad=6)
+    ax_h.set_xlabel("Time (Days)", fontsize=9, color=MUTED_COLOR)
+    ax_h.set_ylabel("Villagers (Count)", fontsize=9, color=MUTED_COLOR)
+    ax_h.grid(True, linestyle=":", alpha=0.6, color="#D1D5DB")
+    ax_h.legend(frameon=True, facecolor=BG_COLOR, edgecolor=BORDER_COLOR, fontsize=8.2)
+    ax_h.tick_params(colors=MUTED_COLOR, labelsize=8.2)
 
     # --------------------------------------------------------------------------
-    # BOTTOM SUBPLOT: Vertical Step-by-Step LaTeX Formulas & Solution
+    # TOP-RIGHT SUBPLOT: Mosquito Population Sectors (Healthy, Infected)
     # --------------------------------------------------------------------------
-    ax_formula = fig.add_axes([0.04, 0.02, 0.92, 0.56])
-    ax_formula.set_facecolor(BG_COLOR)
-    ax_formula.axis("off")
+    ax_m = fig.add_axes([0.56, 0.67, 0.40, 0.27])
+    ax_m.set_facecolor(BG_COLOR)
+    ax_m.plot(result.t, result.MH, label="Healthy Mosq. (M_H)", color="#0D9488", linewidth=2.1)
+    ax_m.plot(result.t, result.MI, label="Infected Mosq. (M_I)", color="#9333EA", linestyle="--", linewidth=2.1)
+    ax_m.set_title(f"Mosquito Population Sectors ({result.days} Days)", fontsize=10.5, fontweight="bold", color=FG_COLOR, pad=6)
+    ax_m.set_xlabel("Time (Days)", fontsize=9, color=MUTED_COLOR)
+    ax_m.set_ylabel("Mosquitoes (Count)", fontsize=9, color=MUTED_COLOR)
+    ax_m.grid(True, linestyle=":", alpha=0.6, color="#D1D5DB")
+    ax_m.legend(frameon=True, facecolor=BG_COLOR, edgecolor=BORDER_COLOR, fontsize=8.2)
+    ax_m.tick_params(colors=MUTED_COLOR, labelsize=8.2)
 
-    card_rect = plt.Rectangle((0, 0), 1, 1, fill=False, edgecolor=BORDER_COLOR, linewidth=1.2)
-    ax_formula.add_patch(card_rect)
+    # --------------------------------------------------------------------------
+    # BOTTOM SUBPLOT: Vertical Step-by-Step LaTeX Formulation & Summary Card
+    # --------------------------------------------------------------------------
+    ax_f = fig.add_axes([0.04, 0.02, 0.92, 0.58])
+    ax_f.set_facecolor(BG_COLOR)
+    ax_f.axis("off")
+    ax_f.add_patch(plt.Rectangle((0, 0), 1, 1, fill=False, edgecolor=BORDER_COLOR, linewidth=1.2))
 
     y_pos = 0.96
 
-    def add_row(text: str, dy: float, fontsize: float = 11.0, bold: bool = False, color: str = FG_COLOR, x: float = 0.05):
+    def add_row(text: str, dy: float, fontsize: float = 10.5, bold: bool = False, color: str = FG_COLOR, x: float = 0.05):
         nonlocal y_pos
-        ax_formula.text(
-            x, y_pos, text,
-            fontsize=fontsize,
-            fontweight=("bold" if bold else "normal"),
-            color=color,
-            va="top",
-        )
+        ax_f.text(x, y_pos, text, fontsize=fontsize, fontweight=("bold" if bold else "normal"), color=color, va="top")
         y_pos -= dy
 
-    # 1. Inputs Given
-    add_row("1. Model Inputs Provided:", 0.042, fontsize=10.5, bold=True, color=FG_COLOR, x=0.03)
-    base_inputs_math = (
-        rf"$N={params.N:.0f},\ M={params.M:.0f},\ a={params.a},\ b={params.b},\ "
-        rf"c={params.c},\ r={params.r},\ \mu_m={params.mu_m},\ \tau={params.tau},\ \text{{Days}}={params.days}$"
-    )
-    add_row(base_inputs_math, 0.046, fontsize=10.2, color="#1F2937")
-    if ext_result is not None:
-        ext_inputs_math = (
-            rf"$\text{{Climate: }}\ T_{{\text{{mean}}}}={params.T_mean}^\circ\text{{C}},\ "
-            rf"A_T={params.A_T}^\circ\text{{C}},\ t_p={params.t_p},\ \kappa={params.kappa}$"
-        )
-        add_row(ext_inputs_math, 0.046, fontsize=10.2, color="#1F2937")
-
-    # 2. Governing ODEs (stacked vertically)
-    y_pos -= 0.012
-    if ext_result is None:
-        add_row(r"2. Governing Ross-Macdonald Differential Equations (with EIP $\tau$):", 0.042, fontsize=10.5, bold=True, color=MUTED_COLOR, x=0.03)
-        add_row(r"$\frac{dX}{dt} = m \cdot a \cdot b \cdot Y(1 - X) - r \cdot X$", 0.062, fontsize=12.0, color="#1E3A8A")
-        add_row(r"$\frac{dY}{dt} = a \cdot c \cdot e^{-\mu_m \tau} X(1 - Y) - \mu_m \cdot Y$", 0.062, fontsize=12.0, color="#1E3A8A")
-    else:
-        add_row("2. Extended Climate-Driven System (x: Humans, z: Latent Mosq., v: Infectious Mosq.):", 0.040, fontsize=10.2, bold=True, color=MUTED_COLOR, x=0.03)
-        add_row(r"$\frac{dx}{dt} = m(t)\,a(T)\,b\,v(1 - x) - r\,x$", 0.056, fontsize=11.5, color="#1E3A8A")
-        add_row(r"$\frac{dz}{dt} = a(T)\,c\,x(1 - z - v) - \left(\frac{1}{\tau(T)} + \mu(T)\right)z$", 0.060, fontsize=11.5, color="#1E3A8A")
-        add_row(r"$\frac{dv}{dt} = \frac{z}{\tau(T)} - \mu(T)\,v$", 0.056, fontsize=11.5, color="#1E3A8A")
-
-    # 3. Step-by-Step R0 Solution (vertical process)
-    y_pos -= 0.012
-    add_row(r"3. Step-by-Step Basic Reproduction Number ($R_0$) Solution:", 0.042, fontsize=10.5, bold=True, color=MUTED_COLOR, x=0.03)
-    add_row(rf"$\text{{Step 1 (Ratio): }}\quad m = \frac{{M}}{{N}} = \frac{{{params.M:.0f}}}{{{params.N:.0f}}} = {result.m:.4f}$", 0.062, fontsize=11.2)
-    add_row(r"$\text{Step 2 (Formula): }\quad R_0 = \frac{m \cdot a^2 \cdot b \cdot c \cdot e^{-\mu_m \tau}}{r \cdot \mu_m}$", 0.066, fontsize=11.5)
+    # 1. Inputs & Active Extensions
+    add_row("1. Chapter 14 Model Inputs & Active Extensions:", 0.038, fontsize=10.2, bold=True, x=0.03)
     add_row(
-        rf"$\text{{Step 3 (Substitute): }}\quad R_0 = \frac{{{result.m:.2f} \times ({params.a})^2 \times {params.b} \times {params.c} \times e^{{-{params.mu_m}\cdot {params.tau}}}}}{{{params.r} \times {params.mu_m}}}$",
-        0.066, fontsize=11.2
+        rf"$H_0={params.H0:.0f},\ S_0={params.S0:.0f},\ I_0={params.I0:.0f},\ "
+        rf"M_{{H0}}={params.MH0:.0f},\ M_{{I0}}={params.MI0:.0f},\ \text{{Days}}={params.days}$",
+        0.040, fontsize=9.8, color="#1F2937"
     )
     add_row(
-        rf"$\text{{Step 4 (Evaluate): }}\quad R_0 = \frac{{{result.numerator:.6f}}}{{{result.denominator:.6f}}} = \mathbf{{{result.R0:.4f}}}$",
-        0.066, fontsize=11.5, bold=True
+        rf"$b_h={params.birth_rate},\ d_h={params.death_rate},\ d_m={params.malaria_death_rate},\ "
+        rf"r_h=1-d_m={params.recovery_rate:.6f},\ i_h={params.immunity_rate},\ \beta={params.bite_rate}$",
+        0.040, fontsize=9.6, color="#1F2937"
+    )
+    ext_tags = []
+    if params.use_seasonal:
+        ext_tags.append("Seasonal mbr/mdr (Opt 2)")
+    if params.use_relapse:
+        ext_tags.append("17% Relapse (Opt 1)")
+    if params.net_policy != "none":
+        ext_tags.append(f"Ghana {params.net_policy.upper()} Policy (Opt 3)")
+    ext_label = ", ".join(ext_tags) if ext_tags else "Baseline Model Only (No Extensions Enabled)"
+    add_row(f"Active Extensions: {ext_label}", 0.042, fontsize=9.5, bold=True, color=ACCENT_BLUE)
+
+    # 2. Governing System (Vertical)
+    y_pos -= 0.008
+    add_row("2. Governing 5-Compartment Equations (RK4, dt = 0.1 day):", 0.038, fontsize=10.2, bold=True, color=MUTED_COLOR, x=0.03)
+    add_row(r"$\frac{dH}{dt} = b_h N + r_{\mathrm{eff}} S - d_h H - \beta_{\mathrm{eff}} H \frac{M_I}{M_H + M_I}$", 0.056, fontsize=11.0, color=ACCENT_BLUE)
+    add_row(r"$\frac{dS}{dt} = \beta_{\mathrm{eff}} H \frac{M_I}{M_H + M_I} - (r_{\mathrm{eff}} + i_h + d_m + d_h) S$", 0.056, fontsize=11.0, color=ACCENT_BLUE)
+    add_row(r"$\frac{dI}{dt} = i_h S - d_h I$", 0.048, fontsize=11.0, color=ACCENT_BLUE)
+    add_row(r"$\frac{dM_H}{dt} = b_m(t)(M_H + M_I) - d_{\mathrm{mos}}(t) M_H - \beta \frac{S}{N + 1} M_H$", 0.056, fontsize=11.0, color=ACCENT_BLUE)
+    add_row(r"$\frac{dM_I}{dt} = \beta \frac{S}{N + 1} M_H - d_{\mathrm{mos}}(t) M_I$", 0.056, fontsize=11.0, color=ACCENT_BLUE)
+
+    if params.use_seasonal:
+        add_row(
+            r"$\text{Seasonal Forcing: }\quad b_m(t)=\frac{\cos(2\pi t/365)+1}{2}(0.02),\quad d_{\mathrm{mos}}(t)=\frac{\cos(2\pi t/365)+1}{2}(0.022)$",
+            0.052, fontsize=9.8, color="#4B5563"
+        )
+
+    # 3. Simulation Results at Final Day
+    y_pos -= 0.008
+    add_row(f"3. Population Breakdown at Day {params.days} & Disease Burden:", 0.038, fontsize=10.2, bold=True, color=MUTED_COLOR, x=0.03)
+    total_h = result.H[-1] + result.S[-1] + result.I[-1]
+    total_m = result.MH[-1] + result.MI[-1]
+    add_row(
+        rf"$\text{{Humans: }}\ H={result.H[-1]:.1f},\ S={result.S[-1]:.2f},\ I={result.I[-1]:.1f}\ (\text{{Total }} N={total_h:.1f})$",
+        0.044, fontsize=10.4
+    )
+    add_row(
+        rf"$\text{{Mosquitoes: }}\ M_H={result.MH[-1]:.1f},\ M_I={result.MI[-1]:.1f}\ (\text{{Total }} M={total_m:.1f})$",
+        0.044, fontsize=10.4
+    )
+    add_row(
+        rf"$\text{{Peak Sick: }}\ {result.peak_sick:.2f}\ \text{{(Day {result.peak_sick_day})}}\quad|\quad "
+        rf"\text{{Cumulative Cases: }}\ {result.cum_infections:.1f}\quad|\quad \text{{Malaria Deaths: }}\ {result.cum_malaria_deaths:.2f}$",
+        0.048, fontsize=10.2, bold=True
     )
 
-    # 4. Outcome & Analytic Equilibrium (vertical process)
-    y_pos -= 0.012
-    add_row("4. Epidemiological Outcome & Analytic Steady-State:", 0.042, fontsize=10.5, bold=True, color=MUTED_COLOR, x=0.03)
-    if result.R0 > 1.0 and result.x_star is not None and result.y_star is not None:
-        tau_term = r"e^{-\mu_m \tau}" if params.tau != 0 else ""
-        add_row(rf"$R_0 = {result.R0:.4f} > 1 \quad \Longrightarrow \quad \text{{Endemic Persistence}}$", 0.048, fontsize=11.0, bold=True, color=ACCENT_GREEN)
+    # 4. Ghana ITN Policy Cost-Benefit (when enabled)
+    if params.net_policy in ("itn", "untreated"):
+        y_pos -= 0.006
+        policy_name = "Insecticide-Treated Nets (ITN, 50% red., $3.50)" if params.net_policy == "itn" else "Untreated Nets (18% red., $2.50)"
+        add_row(f"4. Ghana Village Cost-Benefit Analysis — {policy_name}:", 0.038, fontsize=10.2, bold=True, color=ACCENT_GREEN, x=0.03)
         add_row(
-            rf"$X^* = \frac{{R_0 - 1}}{{R_0 + \frac{{a c {tau_term}}}{{\mu_m}}}} = {result.x_star * 100:.2f}\%$",
-            0.068, fontsize=11.5, color=ACCENT_GREEN
+            f"Nets (2/net): {result.nets_needed} (~{result.households:.1f} Ghana households)  |  Cost: ${result.net_program_cost:,.2f}",
+            0.038, fontsize=9.4, color=FG_COLOR
         )
         add_row(
-            rf"$Y^* = \frac{{a c {tau_term} X^*}}{{a c {tau_term} X^* + \mu_m}} = {result.y_star * 100:.2f}\%$",
-            0.062, fontsize=11.5, color=ACCENT_GREEN
+            f"Cases Averted: {result.cases_averted:,.1f}  |  Saved (@${params.ghana_coi:.2f}): ${result.economic_savings:,.2f}  |  Net: ${result.net_benefit:,.2f}  |  BCR: {result.bcr:.1f}x",
+            0.038, fontsize=9.0, bold=True, color=ACCENT_GREEN
         )
-    else:
-        add_row(rf"$R_0 = {result.R0:.4f} \leq 1 \quad \Longrightarrow \quad \text{{Disease Dies Out}}$", 0.048, fontsize=11.0, bold=True, color=ACCENT_RED)
-        add_row(r"$X^* = 0.00\%, \qquad Y^* = 0.00\%$", 0.055, fontsize=11.5, color=ACCENT_RED)
-
-    if ext_result is not None:
-        ext_peak = float(np.max(ext_result.x) * 100)
-        ext_day = int(np.argmax(ext_result.x))
-        add_row(rf"$\text{{Extended Model Peak Infected Humans: }}\ {ext_peak:.2f}\% \text{{ (Day {ext_day})}}$", 0.045, fontsize=10.8, bold=True, color=ACCENT_GREEN)
 
     return fig
 
 
 def run_sensitivity_analysis(params: SimulationParameters, out_dir: str) -> Tuple[str, str]:
-    """Perform one-at-a-time sensitivity analysis and export CSV + multi-panel PNG."""
+    """Perform required Chapter 14 sensitivity analysis on Immunity Rate and Bite Rate.
+
+    Exports sensitivity_results.csv and multi-panel sensitivity_figure.png.
+    """
     scenarios = [
-        ("Biting Rate (a)", "a", [0.15, 0.30, 0.45], ["a=0.15", "a=0.30", "a=0.45"]),
-        ("Mosq->Human Prob (b)", "b", [0.25, 0.50, 0.75], ["b=0.25", "b=0.50", "b=0.75"]),
-        ("Human Recovery (r)", "r", [0.005, 0.01, 0.02], ["r=0.005", "r=0.01", "r=0.02"]),
-        ("Vector Control (M)", "M", [params.M * 1.0, params.M * 0.75, params.M * 0.50], ["0% red.", "25% red.", "50% red."]),
+        ("Human Immunity Rate (i_h)", "immunity_rate", [0.005, 0.01, 0.02, 0.05], ["i_h=0.005", "i_h=0.01", "i_h=0.02", "i_h=0.05"]),
+        ("Mosquito Bite Rate (beta)", "bite_rate", [0.12, 0.24, 0.36, 0.48], ["beta=0.12", "beta=0.24", "beta=0.36", "beta=0.48"]),
     ]
 
     csv_path = os.path.join(out_dir, "sensitivity_results.csv")
     png_path = os.path.join(out_dir, "sensitivity_figure.png")
 
-    fig, axes = plt.subplots(2, 2, figsize=(10.5, 7.2), dpi=120, facecolor=BG_COLOR)
-    axes_flat = axes.flatten()
-    colors = ["#1F77B4", "#D9381E", "#15803D"]
-
+    fig, axes = plt.subplots(2, 2, figsize=(11.0, 7.6), dpi=120, facecolor=BG_COLOR)
+    colors = ["#1F77B4", "#D9381E", "#15803D", "#9333EA"]
     rows = []
-    for idx, (title, attr, vals, labels) in enumerate(scenarios):
-        ax = axes_flat[idx]
-        ax.set_facecolor(BG_COLOR)
+
+    for row_idx, (title, attr, vals, labels) in enumerate(scenarios):
+        ax_sick = axes[row_idx, 0]
+        ax_imm = axes[row_idx, 1]
+        ax_sick.set_facecolor(BG_COLOR)
+        ax_imm.set_facecolor(BG_COLOR)
+
         for j, (val, lbl) in enumerate(zip(vals, labels)):
             p_mod = SimulationParameters(**{**params.__dict__, attr: val})
-            res_b = simulate_transmission(p_mod)
-            res_e = simulate_extended(p_mod)
-
-            b_peak = float(np.max(res_b.X))
-            b_day = int(np.argmax(res_b.X))
-            e_peak = float(np.max(res_e.x))
-            e_day = int(np.argmax(res_e.x))
-
+            res = simulate_malaria(p_mod)
             rows.append([
-                title, lbl, f"{val:.4f}",
-                f"{b_peak:.6f}", b_day,
-                f"{e_peak:.6f}", e_day,
+                title, lbl, f"{val:.5f}", params.days,
+                f"{res.peak_sick:.2f}", res.peak_sick_day,
+                f"{res.cum_infections:.1f}", f"{res.H[-1]:.1f}", f"{res.S[-1]:.2f}", f"{res.I[-1]:.1f}",
             ])
+            ax_sick.plot(res.t, res.S, color=colors[j], linewidth=1.9, label=lbl)
+            ax_imm.plot(res.t, res.I, color=colors[j], linewidth=1.9, label=lbl)
 
-            ax.plot(res_b.t, res_b.X * 100, color=colors[j], linestyle="-", linewidth=1.8, label=f"Base {lbl}")
-            ax.plot(res_e.t, res_e.x * 100, color=colors[j], linestyle="--", linewidth=1.6, label=f"Ext {lbl}")
+        ax_sick.set_title(f"{title} — Sick Villagers (S)", fontsize=10, fontweight="bold", color=FG_COLOR)
+        ax_sick.set_xlabel("Time (Days)", fontsize=8.5, color=MUTED_COLOR)
+        ax_sick.set_ylabel("Sick Villagers", fontsize=8.5, color=MUTED_COLOR)
+        ax_sick.grid(True, linestyle=":", alpha=0.6, color="#D1D5DB")
+        ax_sick.legend(fontsize=8, frameon=True, facecolor=BG_COLOR, edgecolor=BORDER_COLOR)
 
-        ax.set_title(title, fontsize=10, fontweight="bold", color=FG_COLOR)
-        ax.set_xlabel("Time (Days)", fontsize=8.5, color=MUTED_COLOR)
-        ax.set_ylabel("Infected Humans (%)", fontsize=8.5, color=MUTED_COLOR)
-        ax.grid(True, linestyle=":", alpha=0.6, color="#D1D5DB")
-        ax.legend(fontsize=7, ncol=2, frameon=True, facecolor=BG_COLOR, edgecolor=BORDER_COLOR)
+        ax_imm.set_title(f"{title} — Immune Villagers (I)", fontsize=10, fontweight="bold", color=FG_COLOR)
+        ax_imm.set_xlabel("Time (Days)", fontsize=8.5, color=MUTED_COLOR)
+        ax_imm.set_ylabel("Immune Villagers", fontsize=8.5, color=MUTED_COLOR)
+        ax_imm.grid(True, linestyle=":", alpha=0.6, color="#D1D5DB")
+        ax_imm.legend(fontsize=8, frameon=True, facecolor=BG_COLOR, edgecolor=BORDER_COLOR)
 
-    fig.suptitle("One-at-a-Time Sensitivity Analysis (Solid: Baseline, Dashed: Extended)", fontsize=12, fontweight="bold", color=FG_COLOR)
+    fig.suptitle(f"Chapter 14 Parameter Sensitivity Analysis ({params.days} Days)", fontsize=12, fontweight="bold", color=FG_COLOR)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     fig.savefig(png_path, dpi=150)
     plt.close(fig)
@@ -569,9 +527,9 @@ def run_sensitivity_analysis(params: SimulationParameters, out_dir: str) -> Tupl
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
-            "Parameter", "Scenario", "Value",
-            "Baseline_Peak_Infected_Fraction", "Baseline_Peak_Day",
-            "Extended_Peak_Infected_Fraction", "Extended_Peak_Day",
+            "Parameter", "Scenario", "Value", "Horizon_Days",
+            "Peak_Sick", "Peak_Sick_Day", "Cumulative_Cases",
+            "Final_Healthy", "Final_Sick", "Final_Immune",
         ])
         writer.writerows(rows)
 
@@ -583,7 +541,7 @@ def run_sensitivity_analysis(params: SimulationParameters, out_dir: str) -> Tupl
 # ==============================================================================
 
 class MalariaModelApp:
-    """Consistent, pure white Tkinter GUI with unified graph, LaTeX panel, checks, and exports."""
+    """Pure white Tkinter GUI for the Chapter 14 Malaria Modeling Project."""
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -594,9 +552,11 @@ class MalariaModelApp:
         self.fig_canvas = None
         self.current_fig = None
         self.current_result = None
-        self.current_ext_result = None
         self.current_params = None
-        self.extended_var = tk.BooleanVar(value=False)
+
+        self.seasonal_var = tk.BooleanVar(value=False)
+        self.relapse_var = tk.BooleanVar(value=False)
+        self.net_policy_var = tk.StringVar(value="none")
 
         self._build_header()
         self._build_input_panel()
@@ -604,30 +564,25 @@ class MalariaModelApp:
         self._build_kpi_banner()
         self._build_canvas_panel()
 
-        # Automatically execute initial simulation so plot and formulas render on launch
         self.run_model()
 
     def _build_header(self):
         """Build minimal clean header."""
         header_frame = tk.Frame(self.root, bg=BG_COLOR, pady=5)
         header_frame.pack(fill="x", padx=15)
-
-        lbl_title = tk.Label(header_frame, text=APP_TITLE, font=("Arial", 13, "bold"), fg=FG_COLOR, bg=BG_COLOR)
-        lbl_title.pack()
-        lbl_sub = tk.Label(header_frame, text=APP_SUBTITLE, font=("Arial", 8), fg=MUTED_COLOR, bg=BG_COLOR)
-        lbl_sub.pack(pady=(1, 0))
+        tk.Label(header_frame, text=APP_TITLE, font=("Arial", 13, "bold"), fg=FG_COLOR, bg=BG_COLOR).pack()
+        tk.Label(header_frame, text=APP_SUBTITLE, font=("Arial", 8), fg=MUTED_COLOR, bg=BG_COLOR).pack(pady=(1, 0))
 
     def _build_input_panel(self):
-        """Build input parameter fields (baseline + climate-driven extended) in a uniformly aligned grid."""
+        """Build aligned grid for Chapter 14 populations, rates, and optional extensions."""
         input_frame = tk.LabelFrame(
-            self.root, text="Model Parameters", padx=12, pady=8,
+            self.root, text="Chapter 14 Model Parameters & Optional Extensions", padx=12, pady=8,
             font=("Arial", 9, "bold"), bg=BG_COLOR, fg=FG_COLOR, relief="solid", bd=1,
         )
         input_frame.pack(fill="x", padx=15, pady=4)
 
         for col_idx in range(6):
-            weight = 1 if col_idx % 2 == 0 else 0
-            input_frame.columnconfigure(col_idx, weight=weight)
+            input_frame.columnconfigure(col_idx, weight=(1 if col_idx % 2 == 0 else 0))
 
         self.entries = {}
         entry_style = dict(
@@ -636,93 +591,102 @@ class MalariaModelApp:
             highlightbackground=BORDER_COLOR, highlightcolor=FG_COLOR,
         )
 
-        # Baseline fields in 3 rows x 3 columns
-        for idx, (label_text, default_val, key) in enumerate(BASELINE_FIELDS):
+        # Rows 0-1: Initial populations & duration
+        for idx, (label_text, default_val, key) in enumerate(POPULATION_FIELDS):
             row = idx // 3
             col = (idx % 3) * 2
-            lbl = tk.Label(input_frame, text=label_text, anchor="w", font=("Arial", 8, "bold"), bg=BG_COLOR, fg=MUTED_COLOR)
-            lbl.grid(row=row, column=col, sticky="w", padx=(6, 4), pady=3)
-
+            tk.Label(input_frame, text=label_text, anchor="w", font=("Arial", 8, "bold"), bg=BG_COLOR, fg=MUTED_COLOR).grid(
+                row=row, column=col, sticky="w", padx=(6, 4), pady=2
+            )
             ent = tk.Entry(input_frame, **entry_style)
             ent.insert(0, default_val)
-            ent.grid(row=row, column=col + 1, sticky="w", padx=(0, 14), pady=3)
+            ent.grid(row=row, column=col + 1, sticky="w", padx=(0, 12), pady=2)
             self.entries[key] = ent
 
-        # Subtle horizontal divider
-        divider = tk.Frame(input_frame, height=1, bg=BORDER_COLOR)
-        divider.grid(row=3, column=0, columnspan=6, sticky="ew", pady=(6, 6))
-
-        # Extended toggle checkbox aligned in left column, climate fields aligned in columns 2..5
-        chk_ext = tk.Checkbutton(
-            input_frame,
-            text="Extended (climate-driven) model",
-            variable=self.extended_var,
-            font=("Arial", 8, "bold"),
-            bg=BG_COLOR,
-            fg=FG_COLOR,
-            activebackground=BG_COLOR,
-            selectcolor=BG_COLOR,
-            cursor="hand2",
-            command=self.run_model,
-        )
-        chk_ext.grid(row=4, column=0, columnspan=2, sticky="w", padx=(4, 8), pady=3)
-
-        for idx, (label_text, default_val, key) in enumerate(EXTENDED_FIELDS):
-            row = 4 + (idx // 2)
-            col = 2 + (idx % 2) * 2
-            lbl = tk.Label(input_frame, text=label_text, anchor="w", font=("Arial", 8, "bold"), bg=BG_COLOR, fg=MUTED_COLOR)
-            lbl.grid(row=row, column=col, sticky="w", padx=(6, 4), pady=3)
-
+        # Rows 2-4: Empirical rates & Ghana economic parameters
+        for idx, (label_text, default_val, key) in enumerate(RATE_FIELDS):
+            row = 2 + (idx // 3)
+            col = (idx % 3) * 2
+            tk.Label(input_frame, text=label_text, anchor="w", font=("Arial", 8, "bold"), bg=BG_COLOR, fg=MUTED_COLOR).grid(
+                row=row, column=col, sticky="w", padx=(6, 4), pady=2
+            )
             ent = tk.Entry(input_frame, **entry_style)
             ent.insert(0, default_val)
-            ent.grid(row=row, column=col + 1, sticky="w", padx=(0, 14), pady=3)
+            ent.grid(row=row, column=col + 1, sticky="w", padx=(0, 12), pady=2)
             self.entries[key] = ent
+
+        # Divider
+        tk.Frame(input_frame, height=1, bg=BORDER_COLOR).grid(row=5, column=0, columnspan=6, sticky="ew", pady=(6, 5))
+
+        # Row 6: Optional Extensions Checkboxes & Ghana Net Policy Selector
+        ext_bar = tk.Frame(input_frame, bg=BG_COLOR)
+        ext_bar.grid(row=6, column=0, columnspan=6, sticky="ew")
+
+        tk.Checkbutton(
+            ext_bar, text="Opt 1: 17% Relapse", variable=self.relapse_var,
+            font=("Arial", 8, "bold"), bg=BG_COLOR, fg=FG_COLOR, activebackground=BG_COLOR,
+            selectcolor=BG_COLOR, cursor="hand2", command=self.run_model,
+        ).pack(side="left", padx=(4, 12))
+
+        tk.Checkbutton(
+            ext_bar, text="Opt 2: Seasonal Mosquitoes (cos mbr/mdr)", variable=self.seasonal_var,
+            font=("Arial", 8, "bold"), bg=BG_COLOR, fg=FG_COLOR, activebackground=BG_COLOR,
+            selectcolor=BG_COLOR, cursor="hand2", command=self.run_model,
+        ).pack(side="left", padx=(0, 16))
+
+        tk.Label(ext_bar, text="Opt 3 (Ghana Nets):", font=("Arial", 8, "bold"), bg=BG_COLOR, fg=MUTED_COLOR).pack(side="left", padx=(4, 4))
+        for text, val in [("None", "none"), ("Untreated ($2.50)", "untreated"), ("ITN ($3.50, -50%)", "itn")]:
+            tk.Radiobutton(
+                ext_bar, text=text, variable=self.net_policy_var, value=val,
+                font=("Arial", 8), bg=BG_COLOR, fg=FG_COLOR, activebackground=BG_COLOR,
+                selectcolor=BG_COLOR, cursor="hand2", command=self.run_model,
+            ).pack(side="left", padx=3)
 
     def _build_action_bar(self):
-        """Build consistent action bar with Clear, Copy LaTeX, Checks, Sensitivity, Exports, and Calculate."""
-        bar_frame = tk.Frame(self.root, bg=BG_COLOR)
-        bar_frame.pack(fill="x", padx=15, pady=4)
+        """Build consistent action bar with 200d/2000d presets, checks, sensitivity, and exports."""
+        bar = tk.Frame(self.root, bg=BG_COLOR)
+        bar.pack(fill="x", padx=15, pady=4)
 
         btn_style = dict(
             bg=BG_COLOR, fg=FG_COLOR, font=("Arial", 8, "bold"),
-            activebackground="#F3F4F6", relief="solid", bd=1, padx=10, pady=3, cursor="hand2",
+            activebackground="#F3F4F6", relief="solid", bd=1, padx=8, pady=3, cursor="hand2",
         )
 
-        tk.Button(bar_frame, text="Clear", command=self.clear_fields, **btn_style).pack(side="left")
-        tk.Button(bar_frame, text="Copy LaTeX", command=self.copy_latex_code, **btn_style).pack(side="left", padx=(6, 0))
-        tk.Button(bar_frame, text="Run checks", command=self.run_checks, **btn_style).pack(side="left", padx=(6, 0))
-        tk.Button(bar_frame, text="Sensitivity", command=self.run_sensitivity, **btn_style).pack(side="left", padx=(6, 0))
-        tk.Button(bar_frame, text="Export PNG", command=self.export_png, **btn_style).pack(side="left", padx=(6, 0))
-        tk.Button(bar_frame, text="Export CSV", command=self.export_baseline_csv, **btn_style).pack(side="left", padx=(6, 0))
+        tk.Button(bar, text="200d", command=lambda: self.set_days_and_run(200), **btn_style).pack(side="left")
+        tk.Button(bar, text="2000d", command=lambda: self.set_days_and_run(2000), **btn_style).pack(side="left", padx=(5, 0))
+        tk.Button(bar, text="Copy LaTeX", command=self.copy_latex_code, **btn_style).pack(side="left", padx=(5, 0))
+        tk.Button(bar, text="Run checks", command=self.run_checks, **btn_style).pack(side="left", padx=(5, 0))
+        tk.Button(bar, text="Sensitivity", command=self.run_sensitivity, **btn_style).pack(side="left", padx=(5, 0))
+        tk.Button(bar, text="Export PNG", command=self.export_png, **btn_style).pack(side="left", padx=(5, 0))
+        tk.Button(bar, text="Export CSV", command=self.export_table_csv, **btn_style).pack(side="left", padx=(5, 0))
 
-        self.lbl_copy_status = tk.Label(bar_frame, text="", font=("Arial", 8, "italic"), bg=BG_COLOR, fg=ACCENT_GREEN)
+        self.lbl_copy_status = tk.Label(bar, text="", font=("Arial", 8, "italic"), bg=BG_COLOR, fg=ACCENT_GREEN)
         self.lbl_copy_status.pack(side="left", padx=8)
 
         tk.Button(
-            bar_frame, text="▶ Calculate & Simulate", width=21, bg=FG_COLOR, fg="#FFFFFF",
+            bar, text="▶ Calculate & Simulate", width=20, bg=FG_COLOR, fg="#FFFFFF",
             font=("Arial", 9, "bold"), activebackground="#374151", activeforeground="#FFFFFF",
             relief="solid", bd=1, pady=2, cursor="hand2", command=self.run_model,
         ).pack(side="right")
 
     def _build_kpi_banner(self):
-        """Build evenly aligned 3-column horizontal status banner."""
+        """Build 3-column horizontal KPI status banner."""
         self.banner_frame = tk.Frame(self.root, bg=CARD_BG, relief="solid", bd=1, padx=12, pady=6)
         self.banner_frame.pack(fill="x", padx=15, pady=4)
-        self.banner_frame.columnconfigure(0, weight=1)
-        self.banner_frame.columnconfigure(1, weight=1)
-        self.banner_frame.columnconfigure(2, weight=1)
+        for col in range(3):
+            self.banner_frame.columnconfigure(col, weight=1)
 
-        self.lbl_r0 = tk.Label(self.banner_frame, text="R₀: --", font=("Arial", 9, "bold"), bg=CARD_BG, fg=FG_COLOR, anchor="w")
-        self.lbl_r0.grid(row=0, column=0, sticky="w")
+        self.lbl_humans = tk.Label(self.banner_frame, text="Humans (H/S/I): --", font=("Arial", 8, "bold"), bg=CARD_BG, fg=FG_COLOR, anchor="w")
+        self.lbl_humans.grid(row=0, column=0, sticky="w")
 
-        self.lbl_status = tk.Label(self.banner_frame, text="Status: --", font=("Arial", 9, "bold"), bg=CARD_BG, fg=MUTED_COLOR, anchor="center")
-        self.lbl_status.grid(row=0, column=1, sticky="ew")
+        self.lbl_peak = tk.Label(self.banner_frame, text="Peak Sick: --", font=("Arial", 8, "bold"), bg=CARD_BG, fg=ACCENT_RED, anchor="center")
+        self.lbl_peak.grid(row=0, column=1, sticky="ew")
 
-        self.lbl_eq = tk.Label(self.banner_frame, text="Analytic Steady-State: --", font=("Arial", 8, "bold"), bg=CARD_BG, fg=MUTED_COLOR, anchor="e")
-        self.lbl_eq.grid(row=0, column=2, sticky="e")
+        self.lbl_mosq = tk.Label(self.banner_frame, text="Mosquitoes (MH/MI): --", font=("Arial", 8, "bold"), bg=CARD_BG, fg=MUTED_COLOR, anchor="e")
+        self.lbl_mosq.grid(row=0, column=2, sticky="e")
 
     def _build_canvas_panel(self):
-        """Build scrollable container for the unified Matplotlib figure (plot + vertical formulas)."""
+        """Build vertically scrollable container for the unified figure."""
         outer = tk.Frame(self.root, bg=BG_COLOR)
         outer.pack(fill="both", expand=True, padx=15, pady=4)
 
@@ -736,46 +700,48 @@ class MalariaModelApp:
         self.canvas_container = tk.Frame(self.scroll_canvas, bg=BG_COLOR)
         self.scroll_window = self.scroll_canvas.create_window((0, 0), window=self.canvas_container, anchor="nw")
 
-        self.canvas_container.bind(
-            "<Configure>",
-            lambda _e: self.scroll_canvas.configure(scrollregion=self.scroll_canvas.bbox("all")),
-        )
-        self.scroll_canvas.bind(
-            "<Configure>",
-            lambda e: self.scroll_canvas.itemconfigure(self.scroll_window, width=e.width),
-        )
-        self.scroll_canvas.bind_all(
-            "<MouseWheel>",
-            lambda e: self.scroll_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"),
-        )
+        self.canvas_container.bind("<Configure>", lambda _e: self.scroll_canvas.configure(scrollregion=self.scroll_canvas.bbox("all")))
+        self.scroll_canvas.bind("<Configure>", lambda e: self.scroll_canvas.itemconfigure(self.scroll_window, width=e.width))
+        self.scroll_canvas.bind_all("<MouseWheel>", lambda e: self.scroll_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+
+    def set_days_and_run(self, days: int):
+        """Quickly switch duration (200 or 2000 days) and re-run."""
+        self.entries["days"].delete(0, tk.END)
+        self.entries["days"].insert(0, str(days))
+        self.run_model()
 
     def _parse_params(self) -> Optional[SimulationParameters]:
-        """Validate and parse GUI entries into SimulationParameters."""
+        """Parse and validate GUI inputs."""
         try:
             params = SimulationParameters(
-                N=float(self.entries["N"].get()),
-                M=float(self.entries["M"].get()),
-                a=float(self.entries["a"].get()),
-                b=float(self.entries["b"].get()),
-                c=float(self.entries["c"].get()),
-                r=float(self.entries["r"].get()),
-                mu_m=float(self.entries["mu_m"].get()),
-                tau=float(self.entries["tau"].get()),
+                H0=float(self.entries["H0"].get()),
+                S0=float(self.entries["S0"].get()),
+                I0=float(self.entries["I0"].get()),
+                MH0=float(self.entries["MH0"].get()),
+                MI0=float(self.entries["MI0"].get()),
                 days=int(self.entries["days"].get()),
-                T_mean=float(self.entries["T_mean"].get()),
-                A_T=float(self.entries["A_T"].get()),
-                t_p=float(self.entries["t_p"].get()),
-                kappa=float(self.entries["kappa"].get()),
+                birth_rate=float(self.entries["birth_rate"].get()),
+                death_rate=float(self.entries["death_rate"].get()),
+                malaria_death_rate=float(self.entries["malaria_death_rate"].get()),
+                immunity_rate=float(self.entries["immunity_rate"].get()),
+                mosq_birth_rate=float(self.entries["mosq_birth_rate"].get()),
+                mosq_death_rate=float(self.entries["mosq_death_rate"].get()),
+                bite_rate=float(self.entries["bite_rate"].get()),
+                ghana_coi=float(self.entries["ghana_coi"].get()),
+                family_size=float(self.entries["family_size"].get()),
+                use_seasonal=self.seasonal_var.get(),
+                use_relapse=self.relapse_var.get(),
+                net_policy=self.net_policy_var.get(),
             )
-            if params.N <= 0 or params.M <= 0 or params.days <= 0 or params.tau < 0:
-                raise ValueError("Populations and days must be positive, and tau >= 0.")
+            if params.days <= 0 or (params.H0 + params.S0 + params.I0) <= 0:
+                raise ValueError("Duration and total human population must be positive.")
             return params
         except ValueError as err:
-            messagebox.showerror("Input Error", f"Please ensure all fields contain valid numerical values.\n({err})")
+            messagebox.showerror("Input Error", f"Please ensure all fields contain valid numbers.\n({err})")
             return None
 
     def copy_latex_code(self):
-        """Copy the full substituted LaTeX equations to the system clipboard."""
+        """Copy LaTeX equations to clipboard."""
         if not self.current_result:
             return
         self.root.clipboard_clear()
@@ -784,7 +750,7 @@ class MalariaModelApp:
         self.root.after(2200, lambda: self.lbl_copy_status.config(text=""))
 
     def run_checks(self):
-        """Run verify() suite and display pass/fail result."""
+        """Run verify() suite and show pass/fail summary."""
         params = self._parse_params()
         if params is None:
             return
@@ -795,71 +761,42 @@ class MalariaModelApp:
             messagebox.showerror("Verification Checks: FAIL", details)
 
     def run_sensitivity(self):
-        """Run OAT sensitivity analysis and export CSV + multi-panel PNG."""
+        """Run immunity-rate and bite-rate sensitivity analysis and export CSV + PNG."""
         params = self._parse_params()
         if params is None:
             return
         out_dir = os.path.dirname(os.path.abspath(__file__))
         csv_path, png_path = run_sensitivity_analysis(params, out_dir)
-        messagebox.showinfo(
-            "Sensitivity Analysis Complete",
-            f"Exported results:\n• CSV: {csv_path}\n• PNG: {png_path}",
-        )
+        messagebox.showinfo("Sensitivity Analysis Complete", f"Exported:\n• CSV: {csv_path}\n• PNG: {png_path}")
 
     def export_png(self):
-        """Export the current main unified figure as a PNG file."""
+        """Export current unified figure as PNG."""
         if self.current_fig is None:
-            messagebox.showwarning("Export PNG", "No plot available to export.")
             return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".png",
-            filetypes=[("PNG Image", "*.png")],
-            initialfile="malaria_simulation.png",
-        )
+        path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG Image", "*.png")], initialfile="malaria_ch14_plot.png")
         if path:
             self.current_fig.savefig(path, dpi=150, facecolor=BG_COLOR)
             messagebox.showinfo("Export PNG", f"Saved figure to:\n{path}")
 
-    def export_baseline_csv(self):
-        """Export baseline and extended summary values at days 0, 100, 200, 365 to CSV (matches Table 2)."""
+    def export_table_csv(self):
+        """Export population breakdown at key days (0, 50, 100, 200, 500, 1000, 2000) to CSV."""
         params = self._parse_params()
         if params is None:
             return
-        target_days = [0, 100, 200, 365]
-        p_full = SimulationParameters(**{**params.__dict__, "days": max(params.days, 365)})
-        res_b = simulate_transmission(p_full)
-        res_e = simulate_extended(p_full)
+        target_days = [0, 50, 100, 200, 500, 1000, 2000]
+        p_full = SimulationParameters(**{**params.__dict__, "days": max(params.days, 2000)})
+        res = simulate_malaria(p_full)
 
-        path = filedialog.asksaveasfilename(
-            defaultextension=".csv",
-            filetypes=[("CSV File", "*.csv")],
-            initialfile="simulation_table.csv",
-        )
+        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV File", "*.csv")], initialfile="ch14_population_table.csv")
         if path:
             with open(path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow([
-                    "Day", "Base_Ih", "Base_Iv",
-                    "Ext_Ih", "Ext_Ev", "Ext_Iv", "Temp_C",
-                ])
+                writer.writerow(["Day", "Healthy_Humans", "Sick_Humans", "Immune_Humans", "Total_Humans", "Healthy_Mosquitoes", "Infected_Mosquitoes", "Total_Mosquitoes"])
                 for d in target_days:
-                    writer.writerow([
-                        d, f"{res_b.X[d]:.3f}", f"{res_b.Y[d]:.3f}",
-                        f"{res_e.x[d]:.3f}", f"{res_e.z[d]:.3f}", f"{res_e.v[d]:.3f}",
-                        f"{res_e.T[d]:.1f}",
-                    ])
-            messagebox.showinfo("Export CSV", f"Saved simulation table (days 0, 100, 200, 365) to:\n{path}")
-
-    def clear_fields(self):
-        """Clear all inputs, reset status labels, and clear the canvas."""
-        for ent in self.entries.values():
-            ent.delete(0, tk.END)
-        self.lbl_r0.config(text="R₀: --")
-        self.lbl_status.config(text="Status: --", fg=MUTED_COLOR)
-        self.lbl_eq.config(text="Analytic Steady-State: --")
-        self.current_result = None
-        self.current_ext_result = None
-        self._clear_canvas()
+                    tot_h = res.H[d] + res.S[d] + res.I[d]
+                    tot_m = res.MH[d] + res.MI[d]
+                    writer.writerow([d, f"{res.H[d]:.2f}", f"{res.S[d]:.2f}", f"{res.I[d]:.2f}", f"{tot_h:.2f}", f"{res.MH[d]:.2f}", f"{res.MI[d]:.2f}", f"{tot_m:.2f}"])
+            messagebox.showinfo("Export CSV", f"Saved 2000-day population table to:\n{path}")
 
     def _clear_canvas(self):
         """Destroy current figure canvas and free memory."""
@@ -871,29 +808,27 @@ class MalariaModelApp:
             self.current_fig = None
 
     def run_model(self):
-        """Validate inputs, run RK4 simulation(s), and render unified plot + LaTeX formulas."""
+        """Validate inputs, run RK4 simulation, and render plots + vertical LaTeX card."""
         params = self._parse_params()
         if params is None:
             return
 
         self.current_params = params
-        self.current_result = simulate_transmission(params)
-        self.current_ext_result = simulate_extended(params) if self.extended_var.get() else None
+        self.current_result = simulate_malaria(params)
 
-        # Update KPI banner metrics
-        self.lbl_r0.config(text=f"Baseline R₀: {self.current_result.R0:.4f}")
-        if self.current_result.R0 > 1.0:
-            self.lbl_status.config(text="Status: Endemic Persistence (R₀ > 1)", fg=ACCENT_GREEN)
-            self.lbl_eq.config(
-                text=f"Analytic Steady-State: X* = {self.current_result.x_star * 100:.2f}%, Y* = {self.current_result.y_star * 100:.2f}%"
-            )
-        else:
-            self.lbl_status.config(text="Status: Disease Dies Out (R₀ ≤ 1)", fg=ACCENT_RED)
-            self.lbl_eq.config(text="Analytic Steady-State: (X*, Y*) = (0.00%, 0.00%)")
+        # Update KPI banner
+        self.lbl_humans.config(
+            text=f"Day {params.days} Humans — H: {self.current_result.H[-1]:.1f}, S: {self.current_result.S[-1]:.1f}, I: {self.current_result.I[-1]:.1f}"
+        )
+        self.lbl_peak.config(
+            text=f"Peak Sick: {self.current_result.peak_sick:.1f} (Day {self.current_result.peak_sick_day}) | Cum. Cases: {self.current_result.cum_infections:.0f}"
+        )
+        self.lbl_mosq.config(
+            text=f"Mosquitoes — MH: {self.current_result.MH[-1]:.1f}, MI: {self.current_result.MI[-1]:.1f}"
+        )
 
-        # Re-render unified canvas (plot on top, LaTeX formulas with inputs below)
         self._clear_canvas()
-        self.current_fig = create_unified_figure(params, self.current_result, self.current_ext_result)
+        self.current_fig = create_unified_figure(params, self.current_result)
         self.fig_canvas = FigureCanvasTkAgg(self.current_fig, master=self.canvas_container)
         self.fig_canvas.draw()
         widget = self.fig_canvas.get_tk_widget()
