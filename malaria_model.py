@@ -33,7 +33,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 # Graphical User Interface (GUI) Settings (Pure white minimal theme)
 APP_TITLE = "Malaria Model: Ross-Macdonald Transmission Simulator"
 APP_SUBTITLE = "Baseline & Climate-Driven Host-Vector Models, RK4 Integration & Analytical Solution"
-WINDOW_SIZE = "980x980"
+WINDOW_SIZE = "980x1000"
 BG_COLOR = "#FFFFFF"
 FG_COLOR = "#111827"
 MUTED_COLOR = "#4B5563"
@@ -53,7 +53,7 @@ BASELINE_FIELDS = [
     ("Recovery Rate (r):", "0.01", "r"),
     ("Mosq. Mortality (μ_m):", "0.10", "mu_m"),
     ("EIP (τ, days):", "10", "tau"),
-    ("Duration (Days):", "180", "days"),
+    ("Duration (Days):", "365", "days"),
 ]
 
 # Default Extended (Climate-Driven) Model Parameters
@@ -394,27 +394,33 @@ def create_unified_figure(
     if ext_result is None:
         ax_plot.plot(result.t, result.X * 100, label="Infected Humans (%)", color="#D9381E", linewidth=2.2)
         ax_plot.plot(result.t, result.Y * 100, label="Infected Mosquitoes (%)", color="#1F77B4", linestyle="--", linewidth=2.2)
+        if result.R0 > 1.0 and result.x_star is not None:
+            ax_plot.axhline(result.x_star * 100, color="#D9381E", linestyle=":", linewidth=1.3, alpha=0.8, label=f"Equilibrium x* ({result.x_star * 100:.1f}%)")
         ax_plot.set_title(
             f"Baseline Malaria Transmission Dynamics over {result.days} Days (RK4)",
             fontsize=11.5, fontweight="bold", color=FG_COLOR, pad=8
         )
-        ax_plot.legend(frameon=True, facecolor=BG_COLOR, edgecolor=BORDER_COLOR, fontsize=9, loc="center right")
+        ax_plot.legend(frameon=True, facecolor=BG_COLOR, edgecolor=BORDER_COLOR, fontsize=8.5, loc="center right")
     else:
         l1, = ax_plot.plot(result.t, result.X * 100, label="Baseline Humans (%)", color="#D9381E", linewidth=2.0)
         l2, = ax_plot.plot(ext_result.t, ext_result.x * 100, label="Extended Humans (%)", color="#15803D", linewidth=2.2)
+        lines = [l1, l2]
+        if result.R0 > 1.0 and result.x_star is not None:
+            l_eq = ax_plot.axhline(result.x_star * 100, color="#D9381E", linestyle=":", linewidth=1.3, alpha=0.8, label=f"Baseline Eq. x* ({result.x_star * 100:.1f}%)")
+            lines.append(l_eq)
 
         ax_temp = ax_plot.twinx()
-        l3, = ax_temp.plot(ext_result.t, ext_result.T, label="Temperature T(t) (°C)", color="#6B7280", linestyle=":", linewidth=1.6)
+        l3, = ax_temp.plot(ext_result.t, ext_result.T, label="Temperature T(t) (°C)", color="#6B7280", linestyle="--", linewidth=1.5)
         ax_temp.set_ylabel("Temperature (°C)", fontsize=9.5, color=MUTED_COLOR)
         ax_temp.tick_params(axis="y", colors=MUTED_COLOR, labelsize=8.5)
+        lines.append(l3)
 
         ax_plot.set_title(
             f"Baseline vs. Extended (Climate-Driven) Dynamics over {result.days} Days (RK4)",
             fontsize=11, fontweight="bold", color=FG_COLOR, pad=8
         )
-        lines = [l1, l2, l3]
         labels = [l.get_label() for l in lines]
-        ax_plot.legend(lines, labels, frameon=True, facecolor=BG_COLOR, edgecolor=BORDER_COLOR, fontsize=8.5, loc="upper left")
+        ax_plot.legend(lines, labels, frameon=True, facecolor=BG_COLOR, edgecolor=BORDER_COLOR, fontsize=8.2, loc="upper left")
 
     ax_plot.set_xlabel("Time (Days)", fontsize=9.5, color=MUTED_COLOR)
     ax_plot.set_ylabel("Infected Proportion (%)", fontsize=9.5, color=MUTED_COLOR)
@@ -815,26 +821,34 @@ class MalariaModelApp:
             messagebox.showinfo("Export PNG", f"Saved figure to:\n{path}")
 
     def export_baseline_csv(self):
-        """Export baseline model values at days 0, 100, 200, 365 to CSV."""
+        """Export baseline and extended summary values at days 0, 100, 200, 365 to CSV (matches Table 2)."""
         params = self._parse_params()
         if params is None:
             return
         target_days = [0, 100, 200, 365]
         p_full = SimulationParameters(**{**params.__dict__, "days": max(params.days, 365)})
-        res = simulate_transmission(p_full)
+        res_b = simulate_transmission(p_full)
+        res_e = simulate_extended(p_full)
 
         path = filedialog.asksaveasfilename(
             defaultextension=".csv",
             filetypes=[("CSV File", "*.csv")],
-            initialfile="baseline_table.csv",
+            initialfile="simulation_table.csv",
         )
         if path:
             with open(path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow(["Day", "Infected_Humans_Fraction", "Infected_Humans_Count", "Infected_Mosquitoes_Fraction", "Infected_Mosquitoes_Count"])
+                writer.writerow([
+                    "Day", "Base_Ih", "Base_Iv",
+                    "Ext_Ih", "Ext_Ev", "Ext_Iv", "Temp_C",
+                ])
                 for d in target_days:
-                    writer.writerow([d, f"{res.X[d]:.6f}", f"{res.X[d] * params.N:.2f}", f"{res.Y[d]:.6f}", f"{res.Y[d] * params.M:.2f}"])
-            messagebox.showinfo("Export CSV", f"Saved baseline table (days 0, 100, 200, 365) to:\n{path}")
+                    writer.writerow([
+                        d, f"{res_b.X[d]:.3f}", f"{res_b.Y[d]:.3f}",
+                        f"{res_e.x[d]:.3f}", f"{res_e.z[d]:.3f}", f"{res_e.v[d]:.3f}",
+                        f"{res_e.T[d]:.1f}",
+                    ])
+            messagebox.showinfo("Export CSV", f"Saved simulation table (days 0, 100, 200, 365) to:\n{path}")
 
     def clear_fields(self):
         """Clear all inputs, reset status labels, and clear the canvas."""
